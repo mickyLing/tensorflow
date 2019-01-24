@@ -146,6 +146,7 @@ void RecordYielder::MainLoop() {
     }
 
     if (num_records_added_in_epoch_ < opts_.bufsize) {
+      mutex_lock l(mu_);
       opts_.bufsize = num_records_added_in_epoch_;
     }
 
@@ -205,7 +206,10 @@ void RecordYielder::ShardLoop(Shard* shard) {
       shard->status = errors::InvalidArgument("Can't open ", filename);
       break;
     }
-    io::RecordReader rdr(file.get());
+    io::RecordReaderOptions options =
+        io::RecordReaderOptions::CreateRecordReaderOptions(
+            opts_.compression_type);
+    io::RecordReader rdr(file.get(), options);
     uint64 offset = 0;
     string record;
     while (true) {

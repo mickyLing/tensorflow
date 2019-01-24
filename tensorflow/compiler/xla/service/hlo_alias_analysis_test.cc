@@ -18,15 +18,19 @@ limitations under the License.
 #include <map>
 #include <memory>
 
-#include "tensorflow/compiler/xla/literal_util.h"
+#include "tensorflow/compiler/xla/literal.h"
+#include "tensorflow/compiler/xla/service/flatten_call_graph.h"
+#include "tensorflow/compiler/xla/service/hlo_graph_dumper.h"
 #include "tensorflow/compiler/xla/service/hlo_matchers.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
+#include "tensorflow/compiler/xla/service/hlo_ordering.h"
 #include "tensorflow/compiler/xla/service/instruction_fusion.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/test.h"
 #include "tensorflow/compiler/xla/test_helpers.h"
 #include "tensorflow/compiler/xla/tests/hlo_test_base.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
+#include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/test.h"
 
@@ -37,22 +41,34 @@ using ::testing::UnorderedElementsAre;
 
 class HloAliasAnalysisTest : public HloTestBase {
  protected:
-  HloAliasAnalysisTest() : module_(CreateNewModule()) {}
+  HloAliasAnalysisTest() : HloTestBase() {
+    module_ = CreateNewVerifiedModule();
+  }
 
   // Run alias analysis on the member module. For convenience returns a
   // reference to the generated analysis stored in analysis_.
-  const HloAliasAnalysis& RunAnalysis() {
-    analysis_ = HloAliasAnalysis::Run(module_.get()).ConsumeValueOrDie();
+  HloAliasAnalysis& RunAnalysis() {
+    hlo_graph_dumper::MaybeDumpHloModule(*module_, "Before alias analysis");
+    analysis_ = HloAliasAnalysis::Run(module_.get(),
+                                      /*fusion_can_share_buffer=*/nullptr)
+                    .ConsumeValueOrDie();
     return *analysis_;
   }
 
-  // Return a vector of the buffers in the buffer set at the current position.
+  // Return a vector of the buffers in the buffer set at the current position
+  // sorted by buffer id.
   std::vector<HloBuffer> GetBuffersAt(const HloInstruction* instruction,
                                       const ShapeIndex& index = {}) const {
+    std::set<HloBuffer::Id> buffer_ids;
+    for (const HloValue* value : analysis_->dataflow_analysis()
+                                     .GetValueSet(instruction, index)
+                                     .values()) {
+      buffer_ids.insert(analysis_->GetBufferContainingValue(*value).id());
+    }
+
     std::vector<HloBuffer> buffers;
-    for (const HloBuffer* buffer :
-         analysis_->GetBufferSet(instruction, index).buffers()) {
-      buffers.push_back(*buffer);
+    for (HloBuffer::Id id : buffer_ids) {
+      buffers.push_back(analysis_->GetBuffer(id));
     }
     return buffers;
   }
@@ -78,14 +94,14 @@ class HloAliasAnalysisTest : public HloTestBase {
   // constructed.
   bool AnyValuesInSameBufferInterfere() {
     DependencyHloOrdering ordering(module_.get());
-    for (const HloBuffer* buffer : analysis_->buffers()) {
-      for (const HloValue* value_a : buffer->values()) {
-        for (const HloValue* value_b : buffer->values()) {
+    for (const HloBuffer& buffer : analysis_->buffers()) {
+      for (const HloValue* value_a : buffer.values()) {
+        for (const HloValue* value_b : buffer.values()) {
           if (*value_a != *value_b &&
-              analysis_->dataflow_analysis().MayInterfere(*value_a, *value_b,
-                                                          ordering)) {
+              ordering.MayInterfere(*value_a, *value_b,
+                                    analysis_->dataflow_analysis())) {
             VLOG(1) << *value_a << " interferes with " << *value_b
-                    << " in buffer: " << *buffer;
+                    << " in buffer: " << buffer;
             return true;
           }
         }
@@ -104,9 +120,9 @@ TEST_F(HloAliasAnalysisTest, BinaryOperation) {
   // Test the analysis on a single binary operation (Add).
   auto builder = HloComputation::Builder(TestName());
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto add = builder.AddInstruction(HloInstruction::CreateBinary(
       scalar_shape_, HloOpcode::kAdd, constant1, constant2));
   module_->AddEntryComputation(builder.Build());
@@ -122,8 +138,8 @@ TEST_F(HloAliasAnalysisTest, BinaryOperation) {
               GetValueDefinedAt(instruction));
   }
 
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(add).IsAmbiguous());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(add).IsDistinct());
+  EXPECT_FALSE(analysis.InstructionBuffersAreAmbiguous(add));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(add));
 
   EXPECT_FALSE(AnyValuesInSameBufferInterfere());
 }
@@ -166,12 +182,12 @@ TEST_F(HloAliasAnalysisTest, TupleAndGtes) {
 
   // Verify the positions of an aliased buffer.
   EXPECT_THAT(
-      analysis.GetUniqueBufferAt(param0).positions(),
+      analysis.GetUniqueBufferAt(param0).ComputePositions(),
       UnorderedElementsAre(HloPosition{param0, {}}, HloPosition{tuple, {0}},
                            HloPosition{gte0, {}}));
 
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(tuple).IsAmbiguous());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(tuple).IsDistinct());
+  EXPECT_FALSE(analysis.InstructionBuffersAreAmbiguous(tuple));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(tuple));
 
   EXPECT_FALSE(AnyValuesInSameBufferInterfere());
 }
@@ -191,12 +207,195 @@ TEST_F(HloAliasAnalysisTest, NondistinctTuple) {
   const HloAliasAnalysis& analysis = RunAnalysis();
 
   EXPECT_THAT(
-      analysis.GetUniqueBufferAt(param0).positions(),
+      analysis.GetUniqueBufferAt(param0).ComputePositions(),
       UnorderedElementsAre(HloPosition{param0, {}}, HloPosition{tuple, {0}},
                            HloPosition{tuple, {2}}));
 
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(tuple).IsAmbiguous());
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(tuple).IsDistinct());
+  EXPECT_FALSE(analysis.InstructionBuffersAreAmbiguous(tuple));
+  EXPECT_FALSE(analysis.InstructionBuffersAreDistinct(tuple));
+
+  EXPECT_FALSE(AnyValuesInSameBufferInterfere());
+}
+
+TEST_F(HloAliasAnalysisTest, ParametersWithAliasing) {
+  const Shape tuple_shape =
+      ShapeUtil::MakeTupleShape({scalar_shape_, scalar_shape_});
+
+  auto builder = HloComputation::Builder(TestName());
+  auto param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, tuple_shape, "p0"));
+  auto gte0 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, param, 0));
+  auto gte1 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, param, 1));
+
+  auto negate0 = builder.AddInstruction(
+      HloInstruction::CreateUnary(scalar_shape_, HloOpcode::kNegate, gte0));
+  auto negate1 = builder.AddInstruction(
+      HloInstruction::CreateUnary(scalar_shape_, HloOpcode::kNegate, gte1));
+
+  auto tuple =
+      builder.AddInstruction(HloInstruction::CreateTuple({negate0, negate1}));
+  module_->AddEntryComputation(builder.Build());
+  TF_ASSERT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{0}, /*param_number=*/0, /*param_index=*/{0},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+  TF_ASSERT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{1}, /*param_number=*/0, /*param_index=*/{1},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+
+  // Cannot alias an output twice.
+  ASSERT_IS_NOT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{1}, /*param_number=*/0, /*param_index=*/{0},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+
+  const HloAliasAnalysis& analysis = RunAnalysis();
+
+  EXPECT_EQ(analysis.GetUniqueBufferAt(gte0),
+            analysis.GetUniqueBufferAt(tuple, /*index=*/{0}));
+
+  EXPECT_EQ(analysis.GetUniqueBufferAt(gte1),
+            analysis.GetUniqueBufferAt(tuple, /*index=*/{1}));
+}
+
+TEST_F(HloAliasAnalysisTest, ParametersWithCrossAliasing) {
+  // parameter 0 aliased with output 1 and parameter 1 aliased with output 0.
+  //
+  //  (p0 ,  p1)
+  //     \   /
+  //      \ /
+  // alias X
+  //      / \
+  //     /   \
+  //  (p0  ,  p1)
+  const Shape tuple_shape =
+      ShapeUtil::MakeTupleShape({scalar_shape_, scalar_shape_});
+
+  auto builder = HloComputation::Builder(TestName());
+  auto param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, tuple_shape, "p0"));
+  auto gte0 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, param, 0));
+  auto gte1 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, param, 1));
+  auto tuple =
+      builder.AddInstruction(HloInstruction::CreateTuple({gte0, gte1}));
+  module_->AddEntryComputation(builder.Build());
+  TF_ASSERT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{0}, /*param_number=*/0, /*param_index=*/{1},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+  TF_ASSERT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{1}, /*param_number=*/0, /*param_index=*/{0},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+
+  // Cannot alias an output twice.
+  ASSERT_IS_NOT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{1}, /*param_number=*/0, /*param_index=*/{1},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+
+  const HloAliasAnalysis& analysis = RunAnalysis();
+
+  // Every Ops in this graph are aliased with each other.
+  EXPECT_EQ(analysis.GetUniqueBufferAt(gte0),
+            analysis.GetUniqueBufferAt(tuple, /*index=*/{0}));
+  EXPECT_EQ(analysis.GetUniqueBufferAt(gte0),
+            analysis.GetUniqueBufferAt(tuple, /*index=*/{1}));
+
+  EXPECT_EQ(analysis.GetUniqueBufferAt(gte1),
+            analysis.GetUniqueBufferAt(tuple, /*index=*/{0}));
+  EXPECT_EQ(analysis.GetUniqueBufferAt(gte1),
+            analysis.GetUniqueBufferAt(tuple, /*index=*/{1}));
+}
+
+TEST_F(HloAliasAnalysisTest, InputOutputAliasingWithWhile) {
+  // Test a simple single while instruction can be aliased with input and output
+  // of the computation.
+  //
+  // body((F32[], F32[]) %tuple_param):
+  //   %add = Add(%tuple_param{0}, %tuple_param{1})
+  //   return Tuple(%tuple_param{0}, %add)
+  //
+  // condition((F32[], F32[]) %tuple_param):
+  //   return Constant(false)
+  //
+  // entry:
+  //   %param1 = param1
+  //   %while = While(%param1, body, condition)
+  //   %while_1 = GTE(%while, 0)
+  //   %while_2 = GTE(%while, 1)
+  //   %negate_1 = Negate(%while_1)
+  //   %negate_2 = Negate(%while_2)
+  //   return Tuple(negate_1, negate_2)
+  //
+  const Shape tuple_shape =
+      ShapeUtil::MakeTupleShape({scalar_shape_, scalar_shape_});
+
+  // Element 0 passes transparently through the body.
+  auto body_builder = HloComputation::Builder("body");
+  auto body_param = body_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, tuple_shape, "param"));
+  auto body_element_0 = body_builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, body_param, 0));
+  auto body_element_1 = body_builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, body_param, 1));
+  auto add = body_builder.AddInstruction(HloInstruction::CreateBinary(
+      scalar_shape_, HloOpcode::kAdd, body_element_0, body_element_1));
+  auto body_tuple = body_builder.AddInstruction(
+      HloInstruction::CreateTuple({body_element_0, add}));
+  HloComputation* body = module_->AddEmbeddedComputation(body_builder.Build());
+
+  // Condition computation trivially returns a constant "false".
+  auto cond_builder = HloComputation::Builder("condition");
+  auto cond_param = cond_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, tuple_shape, "param"));
+  cond_builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
+  HloComputation* condition =
+      module_->AddEmbeddedComputation(cond_builder.Build());
+
+  auto builder = HloComputation::Builder(TestName());
+  auto param = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, tuple_shape, "p0"));
+
+  auto xla_while = builder.AddInstruction(
+      HloInstruction::CreateWhile(tuple_shape, condition, body, param));
+  auto while_element_1 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, xla_while, 0));
+  auto while_element_2 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(scalar_shape_, xla_while, 1));
+  auto negate_1 = builder.AddInstruction(HloInstruction::CreateUnary(
+      scalar_shape_, HloOpcode::kNegate, while_element_1));
+  auto negate_2 = builder.AddInstruction(HloInstruction::CreateUnary(
+      scalar_shape_, HloOpcode::kNegate, while_element_2));
+  auto tuple =
+      builder.AddInstruction(HloInstruction::CreateTuple({negate_1, negate_2}));
+  module_->AddEntryComputation(builder.Build());
+  TF_ASSERT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{0}, /*param_number=*/0, /*param_index=*/{0},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+  TF_ASSERT_OK(module_->input_output_alias_config().SetUpAlias(
+      /*output_index=*/{1}, /*param_number=*/0, /*param_index=*/{1},
+      /*kind=*/HloInputOutputAliasConfig::AliasKind::kUserAlias));
+
+  const HloAliasAnalysis& analysis = RunAnalysis();
+
+  EXPECT_THAT(
+      GetValuesInBuffer(analysis.GetUniqueBufferAt(xla_while, /*index=*/{1})),
+      UnorderedElementsAre(GetValueDefinedAt(param, {1}),
+                           GetValueDefinedAt(xla_while, /*index=*/{1}),
+                           GetValueDefinedAt(body_param, {1}),
+                           GetValueDefinedAt(cond_param, {1}),
+                           GetValueDefinedAt(add),
+                           GetValueDefinedAt(negate_2)));
+
+  EXPECT_THAT(
+      analysis.GetUniqueBufferAt(xla_while, /*index=*/{1}).ComputePositions(),
+      UnorderedElementsAre(
+          HloPosition{param, {1}}, HloPosition{xla_while, {1}},
+          HloPosition{while_element_2, {}}, HloPosition{body_param, {1}},
+          HloPosition{body_element_1, {}}, HloPosition{add, {}},
+          HloPosition{body_tuple, {1}}, HloPosition{tuple, {1}},
+          HloPosition{cond_param, {1}}, HloPosition{negate_2, {}}));
 
   EXPECT_FALSE(AnyValuesInSameBufferInterfere());
 }
@@ -216,9 +415,9 @@ TEST_F(HloAliasAnalysisTest, SingleCall) {
 
   auto builder = HloComputation::Builder(TestName());
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto call = builder.AddInstruction(HloInstruction::CreateCall(
       scalar_shape_, {constant1, constant2}, called_computation));
   module_->AddEntryComputation(builder.Build());
@@ -226,16 +425,16 @@ TEST_F(HloAliasAnalysisTest, SingleCall) {
   const HloAliasAnalysis& analysis = RunAnalysis();
 
   // Verify aliasing of the kCall operands and the subcomputation parameters.
-  EXPECT_THAT(analysis.GetUniqueBufferAt(constant1).positions(),
+  EXPECT_THAT(analysis.GetUniqueBufferAt(constant1).ComputePositions(),
               UnorderedElementsAre(HloPosition{constant1, {}},
                                    HloPosition{subparam0, {}}));
-  EXPECT_THAT(analysis.GetUniqueBufferAt(constant2).positions(),
+  EXPECT_THAT(analysis.GetUniqueBufferAt(constant2).ComputePositions(),
               UnorderedElementsAre(HloPosition{constant2, {}},
                                    HloPosition{subparam1, {}}));
 
   // The subcomputation root and the kCall itself should alias.
   EXPECT_THAT(
-      analysis.GetUniqueBufferAt(add).positions(),
+      analysis.GetUniqueBufferAt(add).ComputePositions(),
       UnorderedElementsAre(HloPosition{add, {}}, HloPosition{call, {}}));
 
   EXPECT_FALSE(AnyValuesInSameBufferInterfere());
@@ -255,9 +454,9 @@ TEST_F(HloAliasAnalysisTest, ComputationCalledTwice) {
 
   auto builder = HloComputation::Builder(TestName());
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto call1 = builder.AddInstruction(HloInstruction::CreateCall(
       scalar_shape_, {constant1, constant2}, called_computation));
   auto call2 = builder.AddInstruction(HloInstruction::CreateCall(
@@ -266,10 +465,10 @@ TEST_F(HloAliasAnalysisTest, ComputationCalledTwice) {
 
   const HloAliasAnalysis& analysis = RunAnalysis();
 
-  EXPECT_THAT(analysis.GetUniqueBufferAt(constant1).positions(),
+  EXPECT_THAT(analysis.GetUniqueBufferAt(constant1).ComputePositions(),
               UnorderedElementsAre(HloPosition{constant1, {}},
                                    HloPosition{subparam0, {}}));
-  EXPECT_THAT(analysis.GetUniqueBufferAt(constant2).positions(),
+  EXPECT_THAT(analysis.GetUniqueBufferAt(constant2).ComputePositions(),
               UnorderedElementsAre(HloPosition{constant2, {}},
                                    HloPosition{subparam1, {}}));
 
@@ -277,7 +476,7 @@ TEST_F(HloAliasAnalysisTest, ComputationCalledTwice) {
   // and the first parameter of the subcomputation because 'call1' it is passed
   // as an argument to the subcomputation in 'call2'.
   EXPECT_THAT(
-      analysis.GetUniqueBufferAt(add).positions(),
+      analysis.GetUniqueBufferAt(add).ComputePositions(),
       UnorderedElementsAre(HloPosition{add, {}}, HloPosition{call1, {}},
                            HloPosition{subparam0, {}}, HloPosition{call2, {}}));
 
@@ -287,10 +486,10 @@ TEST_F(HloAliasAnalysisTest, ComputationCalledTwice) {
   EXPECT_THAT(GetBuffersAt(subparam1),
               UnorderedElementsAre(analysis.GetUniqueBufferAt(constant2)));
 
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(subparam0).IsAmbiguous());
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(subparam1).IsAmbiguous());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(subparam0).IsDistinct());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(subparam1).IsDistinct());
+  EXPECT_TRUE(analysis.InstructionBuffersAreAmbiguous(subparam0));
+  EXPECT_FALSE(analysis.InstructionBuffersAreAmbiguous(subparam1));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(subparam0));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(subparam1));
 
   EXPECT_FALSE(AnyValuesInSameBufferInterfere());
 }
@@ -334,15 +533,15 @@ TEST_F(HloAliasAnalysisTest, SingleWhile) {
   auto cond_param = cond_builder.AddInstruction(
       HloInstruction::CreateParameter(0, tuple_shape, "param"));
   cond_builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<bool>(false)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
   HloComputation* condition =
       module_->AddEmbeddedComputation(cond_builder.Build());
 
   auto builder = HloComputation::Builder(TestName());
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto tuple = builder.AddInstruction(
       HloInstruction::CreateTuple({constant1, constant2}));
   auto xla_while = builder.AddInstruction(
@@ -352,23 +551,26 @@ TEST_F(HloAliasAnalysisTest, SingleWhile) {
   const HloAliasAnalysis& analysis = RunAnalysis();
 
   // Verify the positions of the aliased while buffers.
-  EXPECT_THAT(analysis.GetUniqueBufferAt(xla_while, /*index=*/{}).positions(),
-              UnorderedElementsAre(
-                  HloPosition{tuple, {}}, HloPosition{xla_while, {}},
-                  HloPosition{body_param, {}}, HloPosition{body_tuple, {}},
-                  HloPosition{cond_param, {}}));
-  EXPECT_THAT(analysis.GetUniqueBufferAt(xla_while, /*index=*/{0}).positions(),
-              UnorderedElementsAre(
-                  HloPosition{constant1, {}}, HloPosition{tuple, {0}},
-                  HloPosition{xla_while, {0}}, HloPosition{body_param, {0}},
-                  HloPosition{body_element_0, {}}, HloPosition{body_tuple, {0}},
-                  HloPosition{cond_param, {0}}));
-  EXPECT_THAT(analysis.GetUniqueBufferAt(xla_while, /*index=*/{1}).positions(),
-              UnorderedElementsAre(
-                  HloPosition{constant2, {}}, HloPosition{tuple, {1}},
-                  HloPosition{xla_while, {1}}, HloPosition{body_param, {1}},
-                  HloPosition{body_element_1, {}}, HloPosition{add, {}},
-                  HloPosition{body_tuple, {1}}, HloPosition{cond_param, {1}}));
+  EXPECT_THAT(
+      analysis.GetUniqueBufferAt(xla_while, /*index=*/{}).ComputePositions(),
+      UnorderedElementsAre(HloPosition{tuple, {}}, HloPosition{xla_while, {}},
+                           HloPosition{body_param, {}},
+                           HloPosition{body_tuple, {}},
+                           HloPosition{cond_param, {}}));
+  EXPECT_THAT(
+      analysis.GetUniqueBufferAt(xla_while, /*index=*/{0}).ComputePositions(),
+      UnorderedElementsAre(
+          HloPosition{constant1, {}}, HloPosition{tuple, {0}},
+          HloPosition{xla_while, {0}}, HloPosition{body_param, {0}},
+          HloPosition{body_element_0, {}}, HloPosition{body_tuple, {0}},
+          HloPosition{cond_param, {0}}));
+  EXPECT_THAT(
+      analysis.GetUniqueBufferAt(xla_while, /*index=*/{1}).ComputePositions(),
+      UnorderedElementsAre(
+          HloPosition{constant2, {}}, HloPosition{tuple, {1}},
+          HloPosition{xla_while, {1}}, HloPosition{body_param, {1}},
+          HloPosition{body_element_1, {}}, HloPosition{add, {}},
+          HloPosition{body_tuple, {1}}, HloPosition{cond_param, {1}}));
 
   EXPECT_THAT(
       GetValuesInBuffer(analysis.GetUniqueBufferAt(xla_while, /*index=*/{0})),
@@ -424,15 +626,15 @@ TEST_F(HloAliasAnalysisTest, SequentialWhiles) {
   cond_builder.AddInstruction(
       HloInstruction::CreateParameter(0, tuple_shape, "param"));
   cond_builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<bool>(false)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
   HloComputation* condition =
       module_->AddEmbeddedComputation(cond_builder.Build());
 
   auto builder = HloComputation::Builder(TestName());
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto tuple = builder.AddInstruction(
       HloInstruction::CreateTuple({constant1, constant2}));
   auto xla_while0 = builder.AddInstruction(
@@ -442,6 +644,9 @@ TEST_F(HloAliasAnalysisTest, SequentialWhiles) {
   auto xla_while2 = builder.AddInstruction(
       HloInstruction::CreateWhile(tuple_shape, condition, body, xla_while1));
   module_->AddEntryComputation(builder.Build());
+
+  FlattenCallGraph flattener;
+  TF_ASSERT_OK(flattener.Run(module_.get()).status());
 
   const HloAliasAnalysis& analysis = RunAnalysis();
 
@@ -480,7 +685,7 @@ TEST_F(HloAliasAnalysisTest, NestedWhiles) {
     cond_builder.AddInstruction(
         HloInstruction::CreateParameter(0, tuple_shape, "param"));
     cond_builder.AddInstruction(
-        HloInstruction::CreateConstant(Literal::CreateR0<bool>(false)));
+        HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
     return cond_builder.Build();
   };
   // Build separate condition computations so the call graph is flat. The
@@ -525,9 +730,9 @@ TEST_F(HloAliasAnalysisTest, NestedWhiles) {
 
   auto builder = HloComputation::Builder(TestName());
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto tuple = builder.AddInstruction(
       HloInstruction::CreateTuple({constant1, constant2}));
   auto entry_while = builder.AddInstruction(
@@ -590,17 +795,17 @@ TEST_F(HloAliasAnalysisTest, SwizzlingWhile) {
   cond_builder.AddInstruction(
       HloInstruction::CreateParameter(0, tuple_shape, "param"));
   auto cond_constant = cond_builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<bool>(false)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
   HloComputation* condition =
       module_->AddEmbeddedComputation(cond_builder.Build());
 
   auto builder = HloComputation::Builder(TestName());
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto constant3 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(3.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(3.0)));
   auto tuple = builder.AddInstruction(
       HloInstruction::CreateTuple({constant1, constant2, constant3}));
   auto xla_while = builder.AddInstruction(
@@ -613,9 +818,9 @@ TEST_F(HloAliasAnalysisTest, SwizzlingWhile) {
   // HloBuffers.
   EXPECT_THAT(
       analysis.buffers(),
-      UnorderedElementsAre(&analysis.GetUniqueBufferAt(constant1),
-                           &analysis.GetUniqueBufferAt(tuple, /*index=*/{}),
-                           &analysis.GetUniqueBufferAt(cond_constant)));
+      UnorderedElementsAre(analysis.GetUniqueBufferAt(constant1),
+                           analysis.GetUniqueBufferAt(tuple, /*index=*/{}),
+                           analysis.GetUniqueBufferAt(cond_constant)));
 
   // The tuple elements of the while and the three constant inputs should all be
   // smooshed into the same buffer.
@@ -636,19 +841,18 @@ TEST_F(HloAliasAnalysisTest, SwizzlingWhile) {
 }
 
 TEST_F(HloAliasAnalysisTest, TupleSelect) {
-  // Test a kSelect of a tuple value. Non-top-level element flow through the
-  // instruction.
+  // Test a kTupleSelect. Non-top-level element flow through the instruction.
   auto builder = HloComputation::Builder(TestName());
   auto pred = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<bool>(false)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto constant3 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(3.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(3.0)));
   auto constant4 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(4.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(4.0)));
   auto tuple1 =
       builder.AddInstruction(HloInstruction::CreateTuple({constant1}));
   auto tuple2 =
@@ -659,13 +863,13 @@ TEST_F(HloAliasAnalysisTest, TupleSelect) {
       builder.AddInstruction(HloInstruction::CreateTuple({constant4}));
   const Shape tuple_shape = tuple1->shape();
   auto select11 = builder.AddInstruction(HloInstruction::CreateTernary(
-      tuple_shape, HloOpcode::kSelect, pred, tuple1, tuple1));
+      tuple_shape, HloOpcode::kTupleSelect, pred, tuple1, tuple1));
   auto select12 = builder.AddInstruction(HloInstruction::CreateTernary(
-      tuple_shape, HloOpcode::kSelect, pred, tuple1, tuple2));
+      tuple_shape, HloOpcode::kTupleSelect, pred, tuple1, tuple2));
   auto select34 = builder.AddInstruction(HloInstruction::CreateTernary(
-      tuple_shape, HloOpcode::kSelect, pred, tuple3, tuple4));
+      tuple_shape, HloOpcode::kTupleSelect, pred, tuple3, tuple4));
   auto select1234 = builder.AddInstruction(HloInstruction::CreateTernary(
-      tuple_shape, HloOpcode::kSelect, pred, select12, select34));
+      tuple_shape, HloOpcode::kTupleSelect, pred, select12, select34));
 
   module_->AddEntryComputation(builder.Build());
 
@@ -686,21 +890,21 @@ TEST_F(HloAliasAnalysisTest, TupleSelect) {
                                    analysis.GetUniqueBufferAt(constant3),
                                    analysis.GetUniqueBufferAt(constant4)));
 
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(select11).IsAmbiguous());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select12).IsAmbiguous());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select34).IsAmbiguous());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select1234).IsAmbiguous());
+  EXPECT_FALSE(analysis.InstructionBuffersAreAmbiguous(select11));
+  EXPECT_TRUE(analysis.InstructionBuffersAreAmbiguous(select12));
+  EXPECT_TRUE(analysis.InstructionBuffersAreAmbiguous(select34));
+  EXPECT_TRUE(analysis.InstructionBuffersAreAmbiguous(select1234));
 
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select11).IsDistinct());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select12).IsDistinct());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select34).IsDistinct());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select1234).IsDistinct());
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(select11));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(select12));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(select34));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(select1234));
 
   EXPECT_FALSE(AnyValuesInSameBufferInterfere());
 }
 
 TEST_F(HloAliasAnalysisTest, TupleSelectToWhile) {
-  // Test a tuple-shaped kSelect feeding a kWhile instruction. HLO:
+  // Test a tuple-shaped kTupleSelect feeding a kWhile instruction. HLO:
   //
   // body((F32[], F32[]) %tuple_param):
   //   %negate = Negate(%tuple_param{0})
@@ -736,22 +940,22 @@ TEST_F(HloAliasAnalysisTest, TupleSelectToWhile) {
   auto cond_param = cond_builder.AddInstruction(
       HloInstruction::CreateParameter(0, tuple_shape, "param"));
   cond_builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<bool>(false)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
   HloComputation* condition =
       module_->AddEmbeddedComputation(cond_builder.Build());
 
   auto pred = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<bool>(false)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
   auto constant1 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto constant2 = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(2.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(2.0)));
   auto tuple1 =
       builder.AddInstruction(HloInstruction::CreateTuple({constant1}));
   auto tuple2 =
       builder.AddInstruction(HloInstruction::CreateTuple({constant2}));
   auto select = builder.AddInstruction(HloInstruction::CreateTernary(
-      tuple_shape, HloOpcode::kSelect, pred, tuple1, tuple2));
+      tuple_shape, HloOpcode::kTupleSelect, pred, tuple1, tuple2));
   auto xla_while = builder.AddInstruction(
       HloInstruction::CreateWhile(tuple_shape, condition, body, select));
 
@@ -773,11 +977,11 @@ TEST_F(HloAliasAnalysisTest, TupleSelectToWhile) {
                                    GetValueDefinedAt(body_param, /*index=*/{0}),
                                    GetValueDefinedAt(cond_param, /*index=*/{0}),
                                    GetValueDefinedAt(negate)));
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(select).IsAmbiguous());
-  EXPECT_FALSE(analysis.GetInstructionBufferSet(xla_while).IsAmbiguous());
+  EXPECT_FALSE(analysis.InstructionBuffersAreAmbiguous(select));
+  EXPECT_FALSE(analysis.InstructionBuffersAreAmbiguous(xla_while));
 
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(select).IsDistinct());
-  EXPECT_TRUE(analysis.GetInstructionBufferSet(xla_while).IsDistinct());
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(select));
+  EXPECT_TRUE(analysis.InstructionBuffersAreDistinct(xla_while));
 
   // The two operands of the select get flattened into the same buffer resulting
   // in liveness interference.
@@ -788,7 +992,7 @@ TEST_F(HloAliasAnalysisTest, Bitcast) {
   // Bitcasting a value should not produce a new buffer.
   auto builder = HloComputation::Builder(TestName());
   auto constant = builder.AddInstruction(
-      HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
   auto bitcast = builder.AddInstruction(HloInstruction::CreateUnary(
       scalar_shape_, HloOpcode::kBitcast, constant));
 
@@ -800,6 +1004,86 @@ TEST_F(HloAliasAnalysisTest, Bitcast) {
 
   EXPECT_EQ(analysis.GetUniqueBufferAt(constant),
             analysis.GetUniqueBufferAt(bitcast));
+}
+
+TEST_F(HloAliasAnalysisTest, BitcastInterference) {
+  // A bitcast value simultaneously live with its operand should not cause
+  // interference.
+  auto builder = HloComputation::Builder(TestName());
+  auto constant = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
+  auto bitcast = builder.AddInstruction(HloInstruction::CreateUnary(
+      scalar_shape_, HloOpcode::kBitcast, constant));
+  builder.AddInstruction(HloInstruction::CreateTuple({constant, bitcast}));
+
+  module_->AddEntryComputation(builder.Build());
+
+  const HloAliasAnalysis& analysis = RunAnalysis();
+
+  DependencyHloOrdering ordering(module_.get());
+  EXPECT_FALSE(analysis.HasLiveRangeInterference(ordering));
+}
+
+TEST_F(HloAliasAnalysisTest, WhileInterference) {
+  // Build a while loop which has a parallel use of the init value. Depending on
+  // ordering there may be interference between the update-in-place while and
+  // the other use of the init.
+  auto builder = HloComputation::Builder(TestName());
+  auto init = builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<float>(1.0)));
+
+  auto cond_builder = HloComputation::Builder("condition");
+  auto cond_param = cond_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, init->shape(), "param"));
+  auto cond_root = cond_builder.AddInstruction(
+      HloInstruction::CreateConstant(LiteralUtil::CreateR0<bool>(false)));
+  HloComputation* condition =
+      module_->AddEmbeddedComputation(cond_builder.Build());
+
+  auto body_builder = HloComputation::Builder("body");
+  auto body_param = body_builder.AddInstruction(
+      HloInstruction::CreateParameter(0, init->shape(), "param"));
+  auto body_root = body_builder.AddInstruction(
+      HloInstruction::CreateUnary(init->shape(), HloOpcode::kExp, body_param));
+  HloComputation* body = module_->AddEmbeddedComputation(body_builder.Build());
+
+  auto xla_while = builder.AddInstruction(
+      HloInstruction::CreateWhile(init->shape(), condition, body, init));
+
+  auto negate = builder.AddInstruction(
+      HloInstruction::CreateUnary(init->shape(), HloOpcode::kNegate, init));
+  auto entry_root =
+      builder.AddInstruction(HloInstruction::CreateTuple({negate, xla_while}));
+
+  HloComputation* entry = module_->AddEntryComputation(builder.Build());
+
+  const HloAliasAnalysis& analysis = RunAnalysis();
+
+  {
+    // Dependency ordering should interfere because the negate and while are
+    // unordered.
+    DependencyHloOrdering ordering(module_.get());
+    EXPECT_TRUE(analysis.HasLiveRangeInterference(ordering));
+  }
+
+  // For a sequential order, if there is interference iff the negate is after
+  // the while.
+  HloSchedule schedule(module_.get());
+  schedule.set_sequence(body, {body_param, body_root});
+  schedule.set_sequence(condition, {cond_param, cond_root});
+  {
+    schedule.set_sequence(entry, {init, xla_while, negate, entry_root});
+    TF_ASSERT_OK(schedule.Verify());
+    SequentialHloOrdering ordering(schedule);
+    EXPECT_TRUE(analysis.HasLiveRangeInterference(ordering));
+  }
+
+  {
+    schedule.set_sequence(entry, {init, negate, xla_while, entry_root});
+    TF_ASSERT_OK(schedule.Verify());
+    SequentialHloOrdering ordering(schedule);
+    EXPECT_FALSE(analysis.HasLiveRangeInterference(ordering));
+  }
 }
 
 }  // namespace

@@ -495,8 +495,26 @@ MySelect(x:float) -> (z:float) {
   EXPECT_EQ(DebugString(result.nodes), e2);
 }
 
+TEST(TFunc, IntsOnDeviceArgNotSet) {
+  auto fdef = test::function::XTimesTwoInt32();
+  InstantiationResult result;
+  TF_ASSERT_OK(InstantiateFunction(fdef, AttrSlice(), GetOpSig, &result));
+  EXPECT_EQ(5, result.nodes.size());
+  EXPECT_EQ("_Retval", result.nodes[4].op());
+}
+
+TEST(TFunc, IntsOnDeviceArgSet) {
+  auto fdef = test::function::XTimesTwoInt32();
+  (*fdef.mutable_attr())[FunctionLibraryDefinition::kIntsOnDeviceAttr].set_b(
+      true);
+  InstantiationResult result;
+  TF_ASSERT_OK(InstantiateFunction(fdef, AttrSlice(), GetOpSig, &result));
+  EXPECT_EQ(5, result.nodes.size());
+  EXPECT_EQ("_DeviceRetval", result.nodes[4].op());
+}
+
 static void HasError(const Status& s, const string& substr) {
-  EXPECT_TRUE(StringPiece(s.ToString()).contains(substr))
+  EXPECT_TRUE(str_util::StrContains(s.ToString(), substr))
       << ">>" << s << "<<, expected substring >>" << substr << "<<";
 }
 
@@ -938,6 +956,12 @@ TEST(FunctionLibraryDefinitionTest, LookUp) {
   ASSERT_NE(op_def, nullptr);
   EXPECT_EQ(op_def->DebugString(),
             test::function::XTimesTwo().signature().DebugString());
+
+  const OpRegistrationData* op_reg_data;
+  TF_EXPECT_OK(lib_def.LookUp("XTimesTwo", &op_reg_data));
+  ASSERT_NE(op_reg_data, nullptr);
+  // Shape inference function is initialized to UnknownShape.
+  ASSERT_NE(op_reg_data->shape_inference_fn, nullptr);
 }
 
 TEST(FunctionLibraryDefinitionTest, AddFunctionDef) {
@@ -1048,6 +1072,123 @@ TEST(FunctionLibraryDefinitionTest, AddLibrary) {
   TF_EXPECT_OK(lib_def.AddLibrary(lib_def));
 }
 
+GradientDef MakeGradDef(const string& f, const string& g) {
+  GradientDef grad;
+  grad.set_function_name(f);
+  grad.set_gradient_func(g);
+  return grad;
+}
+
+TEST(FunctionLibraryDefinitionTest, AddLibrary_Atomic) {
+  // Create lib def containing two functions with equal names
+  FunctionDefLibrary proto;
+  const string x2_name = test::function::XTimesTwo().signature().name();
+  const string x4_name = test::function::XTimesFour().signature().name();
+  *proto.add_function() = test::function::XTimesTwo();
+  FunctionDef fdef = test::function::XTimesFour();
+  fdef.mutable_signature()->set_name(x2_name);
+  *proto.add_function() = fdef;
+  FunctionLibraryDefinition lib_def(OpRegistry::Global(), FunctionDefLibrary());
+
+  // Try adding the two functions to lib_def
+  Status s = lib_def.AddLibrary(proto);
+  EXPECT_EQ(error::Code::INVALID_ARGUMENT, s.code());
+  EXPECT_EQ(
+      "Cannot add function 'XTimesTwo' because a different function with "
+      "the same name already exists.",
+      s.error_message());
+
+  // Verify that none of the functions are added
+  EXPECT_TRUE(lib_def.Find(x2_name) == nullptr);
+
+  // Fix the name in proto but add two gradient names for it
+  proto.mutable_function(1)->mutable_signature()->set_name(x4_name);
+  *proto.add_gradient() = MakeGradDef(x2_name, x4_name);
+  *proto.add_gradient() = MakeGradDef(x2_name, "SecondGradName");
+
+  // Try adding the library and check that nothing was added
+  s = lib_def.AddLibrary(proto);
+  EXPECT_EQ(error::Code::INVALID_ARGUMENT, s.code());
+  EXPECT_EQ(s.error_message(),
+            "Cannot assign gradient function 'SecondGradName' to 'XTimesTwo' "
+            "because it already has gradient function 'XTimesFour'");
+  EXPECT_TRUE(lib_def.Find(x2_name) == nullptr);
+  EXPECT_EQ(0, lib_def.ToProto().function_size());
+  EXPECT_EQ(0, lib_def.ToProto().gradient_size());
+}
+
+TEST(FunctionLibraryDefinitionTest, AddLibraryDefinition_Atomic_FuncConflict) {
+  const string x2_name = test::function::XTimesTwo().signature().name();
+  const string x4_name = test::function::XTimesFour().signature().name();
+  const string wx_name = test::function::WXPlusB().signature().name();
+
+  // Create FunctionLibraryDefinition with
+  // (func = XTimesTwo, grad = XTimesFour)
+  FunctionDefLibrary proto;
+  *proto.add_function() = test::function::XTimesTwo();
+  *proto.add_gradient() = MakeGradDef(x2_name, x4_name);
+  FunctionLibraryDefinition lib_def(OpRegistry::Global(), proto);
+  EXPECT_EQ(1, lib_def.ToProto().function_size());
+  EXPECT_EQ(1, lib_def.ToProto().gradient_size());
+
+  // Create FunctionLibraryDefinition with (func = WXPlusB, grad = XTimesTwo)
+  // and function (name = XTimesTwo, body = XTimeFour)
+  FunctionDefLibrary proto2;
+  *proto2.add_function() = test::function::WXPlusB();
+  *proto2.add_gradient() = MakeGradDef(wx_name, x2_name);
+  *proto2.add_function() = test::function::XTimesFour();
+  proto2.mutable_function(1)->mutable_signature()->set_name(x2_name);
+  FunctionLibraryDefinition lib_def2(OpRegistry::Global(), proto2);
+
+  // Verify that adding lib_def2 will fail because of function conflict
+  // and WXPlusB is not added.
+  Status s = lib_def.AddLibrary(lib_def2);
+  EXPECT_EQ(error::Code::INVALID_ARGUMENT, s.code());
+  EXPECT_EQ(
+      "Cannot add function 'XTimesTwo' because a different function "
+      "with the same name already exists.",
+      s.error_message());
+  EXPECT_TRUE(lib_def.Find(wx_name) == nullptr);
+  EXPECT_EQ(1, lib_def.ToProto().function_size());
+  EXPECT_EQ(1, lib_def.ToProto().gradient_size());
+}
+
+TEST(FunctionLibraryDefinitionTest, AddLibraryDefinition_Atomic_GradConflict) {
+  const string x2_name = test::function::XTimesTwo().signature().name();
+  const string x4_name = test::function::XTimesFour().signature().name();
+  const string wx_name = test::function::WXPlusB().signature().name();
+
+  // Create FunctionLibraryDefinition with
+  // (func = XTimesTwo, grad = XTimesFour)
+  FunctionDefLibrary proto;
+  *proto.add_function() = test::function::XTimesTwo();
+  *proto.add_gradient() = MakeGradDef(x2_name, x4_name);
+  FunctionLibraryDefinition lib_def(OpRegistry::Global(), proto);
+  EXPECT_EQ(1, lib_def.ToProto().function_size());
+  EXPECT_EQ(1, lib_def.ToProto().gradient_size());
+
+  // Create FunctionLibraryDefinition with (func = WXPlusB, grad = XTimesTwo)
+  // and (func = XTimesTwo, grad = WXPlusB)
+  FunctionDefLibrary proto2;
+  *proto2.add_function() = test::function::WXPlusB();
+  *proto2.add_gradient() = MakeGradDef(wx_name, x2_name);
+  *proto2.add_function() = test::function::XTimesTwo();
+  *proto2.add_gradient() = MakeGradDef(x2_name, wx_name);
+  FunctionLibraryDefinition lib_def2(OpRegistry::Global(), proto2);
+
+  // Verify that adding lib_def2 will fail because of gradient conflict
+  // and WXPlusB is not added.
+  Status s = lib_def.AddLibrary(lib_def2);
+  EXPECT_EQ(error::Code::INVALID_ARGUMENT, s.code());
+  EXPECT_EQ(
+      "Cannot assign gradient function 'WXPlusB' to 'XTimesTwo'"
+      " because it already has gradient function 'XTimesFour'",
+      s.error_message());
+  EXPECT_TRUE(lib_def.Find(wx_name) == nullptr);
+  EXPECT_EQ(1, lib_def.ToProto().function_size());
+  EXPECT_EQ(1, lib_def.ToProto().gradient_size());
+}
+
 TEST(FunctionLibraryDefinitionTest, ToProto) {
   FunctionDefLibrary proto1;
   *proto1.add_function() = test::function::XTimesTwo();
@@ -1071,6 +1212,17 @@ TEST(FunctionLibraryDefinitionTest, ToProto) {
   TF_EXPECT_OK(lib_def1.LookUpOpDef("WXPlusB", &f3));
   TF_EXPECT_OK(lib_def2.LookUpOpDef("WXPlusB", &f4));
   EXPECT_EQ(f3->DebugString(), f4->DebugString());
+}
+
+TEST(FunctionLibraryDefinitionTest, FunctionNames) {
+  FunctionDefLibrary proto;
+  *proto.add_function() = test::function::XTimesTwo();
+  *proto.add_function() = test::function::WXPlusB();
+  const FunctionLibraryDefinition lib_def(OpRegistry::Global(), proto);
+
+  const std::vector<string> function_names = lib_def.ListFunctionNames();
+  const std::vector<string> expected = {"XTimesTwo", "WXPlusB"};
+  EXPECT_EQ(function_names, expected);
 }
 
 TEST(FunctionLibraryDefinitionTest, GetAttr_FuncNoAttr) {
@@ -1153,41 +1305,124 @@ TEST(FunctionLibraryDefinitionTest, GetAttr_Gradient) {
   EXPECT_EQ(annotation, false);  // WXPlusB has no custom gradient.
 }
 
+TEST(FunctionLibraryDefinitionTest, ReachableDefinitions) {
+  using ::tensorflow::test::function::GDef;
+  using ::tensorflow::test::function::NDef;
+  using FDH = ::tensorflow::FunctionDefHelper;
+
+  const auto make_simple_fdef = [](const string& name,
+                                   const string& interface_name) {
+    auto func_def = FDH::Create(
+        name, {"x:T", "y:T"}, {"z:T"}, {"T: {float, double}"},
+        {{{"output"}, "Mul", {"x", "y"}, {{"T", "$T"}}}},
+        /* Mapping between function returns and function node outputs. */
+        {{"z", "output:z:0"}});
+
+    if (!interface_name.empty()) {
+      auto* attr = func_def.mutable_attr();
+      (*attr)["experimental_api_implements"].set_s(interface_name);
+    }
+    return func_def;
+  };
+
+  FunctionDef func_1 = make_simple_fdef("Func1", "");
+  FunctionDef func_2 = make_simple_fdef("Func2", "");
+  FunctionDef func_3 = make_simple_fdef("Func3", "");
+  FunctionDef func_4 = make_simple_fdef("Func4", "api_1");
+  FunctionDef func_5 = make_simple_fdef("Func5", "api_1");
+  FunctionDef func_6 = make_simple_fdef("Func6", "api_2");
+
+  FunctionDef func_2_grad = make_simple_fdef("Func2_grad", "");
+
+  constexpr char kDevice[] = "/device:CPU:0";
+
+  GraphDef graph = GDef(
+      {
+          NDef("a", "Placeholder", {}, {{"dtype", DT_FLOAT}}, kDevice),
+          NDef("b", "Placeholder", {}, {{"dtype", DT_FLOAT}}, kDevice),
+          NDef("x", "Func1", {"a", "b"}, {{"T", DT_FLOAT}}, kDevice),
+          NDef("y", "PartitionedCall", {"a", "b"},
+               {{"Tin", DataTypeSlice{DT_FLOAT, DT_FLOAT}},
+                {"Tout", DataTypeSlice{DT_FLOAT}},
+                {"f", FDH::FunctionRef("Func2", {{"T", DT_FLOAT}})}},
+               kDevice),
+          NDef("z", "Func4", {"a", "b"}, {{"T", DT_FLOAT}}, kDevice),
+      },
+      // FunctionLib
+      {func_1, func_2, func_3, func_2_grad, func_4, func_5, func_6});
+
+  // Register custom function gradient after the graph was constructed.
+  GradientDef* func3_grad_def = graph.mutable_library()->add_gradient();
+  func3_grad_def->set_function_name("Func2");
+  func3_grad_def->set_gradient_func("Func2_grad");
+
+  FunctionLibraryDefinition flib(OpRegistry::Global(), graph.library());
+
+  // - 'Func1' is called directly from the graph.
+  // - 'Func2' is called indirectly via a PartitionedCall attribute, and it also
+  //   has a custom gradient ('Func2_grad') that must remain in the library.
+  // - 'Func3' is unreachable and has to be removed from the library
+  // - 'Func4' is called directly from the graph
+  // - 'Func5' is not called directly, but it implements same interface as Func4
+  //   which is directly called.
+  // - 'Func6' is not called directly, and the interface it implements has not
+  //   not been called by another nodes in the graph.
+  FunctionLibraryDefinition reachable_flib = flib.ReachableDefinitions(graph);
+  EXPECT_EQ(reachable_flib.num_functions(), 5);
+  EXPECT_TRUE(reachable_flib.Contains("Func1"));
+  EXPECT_TRUE(reachable_flib.Contains("Func2"));
+  EXPECT_TRUE(reachable_flib.Contains("Func2_grad"));
+  EXPECT_FALSE(reachable_flib.Contains("Func3"));
+  EXPECT_TRUE(reachable_flib.Contains("Func4"));
+  EXPECT_TRUE(reachable_flib.Contains("Func5"));
+  EXPECT_FALSE(reachable_flib.Contains("Func6"));
+}
+
 // TODO(skyewm): this could be more thorough
 TEST(FunctionDefsEqualTest, TestFunctionDefsEqual) {
   // Equal functions
   const FunctionDef fdef1 = test::function::XTimesTwo();
   FunctionDef fdef2 = test::function::XTimesTwo();
+  uint64 hash1 = FunctionDefHash(fdef1);
   EXPECT_TRUE(FunctionDefsEqual(fdef1, fdef2));
+  EXPECT_EQ(hash1, FunctionDefHash(fdef2));
 
   // Different functions
   fdef2 = test::function::XTimesFour();
   EXPECT_FALSE(FunctionDefsEqual(fdef1, fdef2));
+  EXPECT_NE(hash1, FunctionDefHash(fdef2));
 
   // Different signatures
   fdef2 = test::function::XTimesTwo();
   fdef2.mutable_signature()->mutable_input_arg(0)->set_name("foo");
   EXPECT_FALSE(FunctionDefsEqual(fdef1, fdef2));
+  EXPECT_NE(hash1, FunctionDefHash(fdef2));
 
   // Descriptions must be equal
   fdef2 = test::function::XTimesTwo();
   fdef2.mutable_signature()->mutable_input_arg(0)->set_description("foo");
   EXPECT_FALSE(FunctionDefsEqual(fdef1, fdef2));
+  EXPECT_NE(hash1, FunctionDefHash(fdef2));
 
   // Different NodeDefs
   fdef2 = test::function::XTimesTwo();
-  *fdef2.add_node_def() = fdef2.node_def(0);
+  NodeDef* ndef = fdef2.add_node_def();
+  *ndef = fdef2.node_def(0);
+  ndef->set_name("new_name");
   EXPECT_FALSE(FunctionDefsEqual(fdef1, fdef2));
+  EXPECT_NE(hash1, FunctionDefHash(fdef2));
 
   // Different return values
   fdef2 = test::function::XTimesTwo();
   (*fdef2.mutable_ret())["y"] = "y:z:1";  // originally is "y:z:0"
   EXPECT_FALSE(FunctionDefsEqual(fdef1, fdef2));
+  EXPECT_NE(hash1, FunctionDefHash(fdef2));
 
   // Different attributes
   fdef2 = test::function::XTimesTwo();
   SetAttrValue(&fdef2, "ExtraAttr", true);
   EXPECT_FALSE(FunctionDefsEqual(fdef1, fdef2));
+  EXPECT_NE(hash1, FunctionDefHash(fdef2));
 
   // Multiple equivalent attributes; the two functions should be equal.
   fdef2 = test::function::XTimesTwo();
@@ -1199,6 +1434,7 @@ TEST(FunctionDefsEqualTest, TestFunctionDefsEqual) {
   SetAttrValue(&fdef2, "Baz", "abc");
   SetAttrValue(&fdef3, "Baz", "abc");
   EXPECT_TRUE(FunctionDefsEqual(fdef2, fdef3));
+  EXPECT_EQ(FunctionDefHash(fdef2), FunctionDefHash(fdef3));
 }
 
 }  // end namespace

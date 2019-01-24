@@ -20,7 +20,6 @@
 namespace tensorflow {
 using shape_inference::DimensionHandle;
 using shape_inference::InferenceContext;
-using shape_inference::ShapeHandle;
 
 namespace tensorforest {
 
@@ -91,6 +90,7 @@ REGISTER_OP("TreePredictionsV4")
     .Input("sparse_input_values: float")
     .Input("sparse_input_shape: int64")
     .Output("predictions: float")
+    .Output("tree_paths: string")
     .SetShapeFn([](InferenceContext* c) {
       DimensionHandle num_points = c->UnknownDim();
 
@@ -100,6 +100,7 @@ REGISTER_OP("TreePredictionsV4")
       }
 
       c->set_output(0, c->Matrix(num_points, c->UnknownDim()));
+      c->set_output(1, c->Vector(c->UnknownDim()));
       return Status::OK();
     })
     .Doc(R"doc(
@@ -113,6 +114,7 @@ sparse_input_indices: The indices tensor from the SparseTensor input.
 sparse_input_values: The values tensor from the SparseTensor input.
 sparse_input_shape: The shape tensor from the SparseTensor input.
 predictions: `predictions[i][j]` is the probability that input i is class j.
+tree_paths: `tree_paths[i]` is a serialized TreePath proto for example i.
 )doc");
 
 REGISTER_OP("TraverseTreeV4")
@@ -163,7 +165,7 @@ tree_handle: The handle to the tree.
 leaf_ids: `leaf_ids[i]` is the leaf id for input i.
 input_labels: The training batch's labels as a 1 or 2-d tensor.
   'input_labels[i][j]' gives the j-th label/target for the i-th input.
-input_weights: The training batch's eample weights as a 1-d tensor.
+input_weights: The training batch's weights as a 1-d tensor.
   'input_weights[i]' gives the weight for the i-th input.
 )doc");
 

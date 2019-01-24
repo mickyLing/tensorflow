@@ -14,11 +14,11 @@ limitations under the License.
 ==============================================================================*/
 // See docs in ../ops/image_ops.cc.
 #include <math.h>
+#include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/types.h"
-#include "tensorflow/core/kernels/bounds_check.h"
 #include "tensorflow/core/lib/random/simple_philox.h"
 #include "tensorflow/core/util/guarded_philox_random.h"
 
@@ -387,9 +387,9 @@ class SampleDistortedBoundingBoxV2Op : public OpKernel {
     OP_REQUIRES_OK(
         context, context->allocate_output(2, TensorShape({1, 1, 4}), &bboxes));
 
-    typename TTypes<T, 1>::Tensor begin_data = begin->tensor<T, 1>();
-    typename TTypes<T, 1>::Tensor size_data = size->tensor<T, 1>();
-    typename TTypes<float, 3>::Tensor bboxes_data = bboxes->tensor<float, 3>();
+    typename TTypes<T, 1>::Tensor begin_data(begin->tensor<T, 1>());
+    typename TTypes<T, 1>::Tensor size_data(size->tensor<T, 1>());
+    TTypes<float, 3>::Tensor bboxes_data = bboxes->tensor<float, 3>();
 
     begin_data(0) = T(offset_height);
     size_data(0) = T(target_height);

@@ -9,7 +9,7 @@
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or  implied.
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
@@ -39,7 +39,9 @@ def resampler(data, warp, name="resampler"):
       data_num_channels]` containing 2D data that will be resampled.
     warp: Tensor of minimum rank 2 containing the coordinates at which
       resampling will be performed. Since only bilinear interpolation is
-      currently supported, the last dimension of the `warp` tensor must be 2.
+      currently supported, the last dimension of the `warp` tensor must be 2,
+      representing the (x, y) coordinate where x is the index for width and y is
+      the index for height.
     name: Optional name of the op.
 
   Returns:

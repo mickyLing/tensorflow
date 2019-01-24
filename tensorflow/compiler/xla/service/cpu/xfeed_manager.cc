@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/service/cpu/xfeed_manager.h"
 
+#include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/core/platform/logging.h"
 
 namespace xla {
@@ -30,16 +31,18 @@ void XfeedQueueManager::Reset() {
   tensorflow::mutex_lock l(mu_);
   CHECK(current_buffer_ == nullptr);
   for (auto buffer : enqueued_buffers_) {
-    buffer->Done();
+    buffer->Done(ShapeUtil::MakeNil());
   }
   enqueued_buffers_.clear();
 }
 
-void XfeedQueueManager::EnqueueBuffers(
-    tensorflow::gtl::ArraySlice<XfeedBuffer*> buffers) {
+void XfeedQueueManager::EnqueueBuffersAtomically(
+    absl::Span<XfeedBuffer* const> buffers) {
   tensorflow::mutex_lock l(mu_);
   bool was_empty = enqueued_buffers_.empty();
   for (XfeedBuffer* b : buffers) {
+    VLOG(3) << "Enqueueing " << queue_name_ << " buffer (of " << buffers.size()
+            << " buffers) with length: " << b->length();
     enqueued_buffers_.push_back(b);
   }
   if (was_empty && !buffers.empty()) {
@@ -53,21 +56,27 @@ void XfeedQueueManager::EnqueueBuffers(
 
 XfeedBuffer* XfeedQueueManager::BlockingDequeueBuffer() {
   tensorflow::mutex_lock l(mu_);
+  VLOG(3) << "Waiting for an available buffer.";
   while (enqueued_buffers_.empty()) {
     cv_.wait(l);
   }
+  VLOG(3) << "A buffer is available!";
   CHECK(current_buffer_ == nullptr);
   current_buffer_ = enqueued_buffers_.front();
   enqueued_buffers_.pop_front();
   return current_buffer_;
 }
 
-void XfeedQueueManager::ReleaseCurrentBuffer(int32 length, void* data) {
+void XfeedQueueManager::ReleaseCurrentBuffer(int32 length, void* data,
+                                             StatusOr<Shape> shape) {
+  VLOG(3) << "Releasing buffer with shape: "
+          << (shape.ok() ? ShapeUtil::HumanString(shape.ValueOrDie())
+                         : "<error status>");
   tensorflow::mutex_lock l(mu_);
   CHECK(current_buffer_ != nullptr);
   CHECK_EQ(length, current_buffer_->length());
   CHECK_EQ(data, current_buffer_->data());
-  current_buffer_->Done();
+  current_buffer_->Done(std::move(shape));
   current_buffer_ = nullptr;
 }
 

@@ -12,18 +12,6 @@ package(default_visibility = ["//visibility:public"])
 exports_files(["LICENSE"])
 
 filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
-)
-
-filegroup(
     name = "custom_op_sources",
     srcs = glob(
         ["core/ops/*.cc"],
@@ -88,7 +76,7 @@ cc_library(
     deps = [
         "//tensorflow/core:framework_headers_lib",
         "//third_party/eigen3",
-        "@protobuf//:protobuf_headers",
+        "@protobuf_archive//:protobuf_headers",
     ],
 )
 
@@ -105,8 +93,8 @@ tf_custom_op_py_library(
     srcs_version = "PY2AND3",
     deps = [
         ":training_ops",
+        "//tensorflow/contrib/util:util_py",
         "//tensorflow/python:array_ops",
-        "//tensorflow/python:framework",
         "//tensorflow/python:framework_for_generated_wrappers",
         "//tensorflow/python:math_ops",
         "//tensorflow/python:platform",
@@ -180,7 +168,6 @@ py_test(
     deps = [
         ":ops_lib",
         ":training_ops",
-        "//tensorflow:tensorflow_py",
         "//tensorflow/python:framework_test_lib",
         "//tensorflow/python:platform_test",
     ],

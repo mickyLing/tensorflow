@@ -80,9 +80,9 @@ class _OverridableStateManager(PassthroughStateManager):
       # Explicit start state has been provided, so we should use that.
       if mode == estimator_lib.ModeKeys.TRAIN:
         raise ValueError(
-            ("Overriding saved state for training is not supported (but a value"
-             "for feature {} was specified)."
-            ).format(feature_keys.FilteringFeatures.STATE_TUPLE))
+            "Overriding saved state for training is not supported (but a value "
+            "for feature {} was specified).".format(
+                feature_keys.FilteringFeatures.STATE_TUPLE))
       start_state = features[feature_keys.FilteringFeatures.STATE_TUPLE]
       del features[feature_keys.FilteringFeatures.STATE_TUPLE]
       return model.get_batch_loss(
@@ -149,6 +149,7 @@ class ChainingStateManager(_OverridableStateManager):
         key_dtype=dtypes.int64,
         default_values=self._start_state,
         empty_key=-1,
+        deleted_key=-2,
         name="cached_states",
         checkpoint=self._checkpoint_state)
 

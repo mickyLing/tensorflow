@@ -21,8 +21,6 @@ from __future__ import print_function
 import six
 
 from tensorflow.contrib import framework as contrib_framework
-from tensorflow.python.framework import constant_op
-from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import clip_ops
@@ -41,7 +39,7 @@ OPTIMIZER_CLS_NAMES = {
     "Adagrad": train.AdagradOptimizer,
     "Adam": train.AdamOptimizer,
     "Ftrl": train.FtrlOptimizer,
-    "Momentum": train.MomentumOptimizer,
+    "Momentum": lambda learning_rate: train.MomentumOptimizer(learning_rate, momentum=0.9),  # pylint: disable=line-too-long
     "RMSProp": train.RMSPropOptimizer,
     "SGD": train.GradientDescentOptimizer,
 }
@@ -129,8 +127,9 @@ def optimize_loss(loss,
                `None` to use all trainable variables.
     name: The name for this operation is used to scope operations and summaries.
     summaries: List of internal quantities to visualize on tensorboard. If not
-               set only the loss and the learning rate will be reported. The
-               complete list is in OPTIMIZER_SUMMARIES.
+               set, the loss, the learning rate, and the global norm of the
+               gradients will be reported. The complete list of possible values
+               is in OPTIMIZER_SUMMARIES.
     colocate_gradients_with_ops: If True, try colocating gradients with the
                                  corresponding op.
     increment_global_step: Whether to increment `global_step`. If your model
@@ -155,9 +154,9 @@ def optimize_loss(loss,
   loss = ops.convert_to_tensor(loss)
   contrib_framework.assert_scalar(loss)
   if global_step is None:
-    global_step = contrib_framework.get_global_step()
+    global_step = train.get_global_step()
   else:
-    contrib_framework.assert_global_step(global_step)
+    train.assert_global_step(global_step)
   with vs.variable_scope(name, "OptimizeLoss", [loss, global_step]):
     # Update ops take UPDATE_OPS collection if not provided.
     if update_ops is None:
@@ -432,12 +431,11 @@ def _multiply_gradients(grads_and_vars, gradient_multipliers):
     if (grad is not None and
         (var in gradient_multipliers or var.name in gradient_multipliers)):
       key = var if var in gradient_multipliers else var.name
-      multiplier = constant_op.constant(
-          gradient_multipliers[key], dtype=dtypes.float32)
+      multiplier = gradient_multipliers[key]
       if isinstance(grad, ops.IndexedSlices):
         grad_values = grad.values * multiplier
         grad = ops.IndexedSlices(grad_values, grad.indices, grad.dense_shape)
       else:
-        grad *= multiplier
+        grad *= math_ops.cast(multiplier, grad.dtype)
     multiplied_grads_and_vars.append((grad, var))
   return multiplied_grads_and_vars
